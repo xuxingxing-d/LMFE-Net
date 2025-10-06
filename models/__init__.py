@@ -1,1 +1,1 @@
-from .LMFENet import LMFE_Net, lmfe_net
+from .Lmfenet import lmfe_net, LMFE_Net
