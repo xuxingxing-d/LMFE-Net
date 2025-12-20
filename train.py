@@ -29,72 +29,123 @@ args = parser.parse_args()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
 # Initialize LPIPS and SSIM modules
 lpips_fn = lpips.LPIPS(net='alex').cuda()  # using AlexNet-based LPIPS
 ssim_fn = SSIM(data_range=1.0).cuda()
 
 
-class SpatialLoss(nn.Module):
-    def __init__(self):
-        super(SpatialLoss, self).__init__()
+class CharbonnierLoss(nn.Module):
+
+    def __init__(self, eps=1e-3):
+        super(CharbonnierLoss, self).__init__()
+        self.eps = eps
 
     def forward(self, x, y):
-        return torch.mean(torch.abs(x - y))
+        diff = x.to('cuda:0') - y.to('cuda:0')
+        loss = torch.mean(torch.sqrt((diff * diff) + (self.eps*self.eps)))
+        return loss
 
-class FrequencyLoss(nn.Module):
+
+class EdgeLoss(nn.Module):
     def __init__(self):
-        super(FrequencyLoss, self).__init__()
+        super(EdgeLoss, self).__init__()
+        k = torch.Tensor([[.05, .25, .4, .25, .05]])
+        self.kernel = torch.matmul(k.t(),k).unsqueeze(0).repeat(3,1,1,1)
+        if torch.cuda.is_available():
+            self.kernel = self.kernel.to('cuda:0')
+        self.loss = CharbonnierLoss()
+
+    def conv_gauss(self, img):
+        n_channels, _, kw, kh = self.kernel.shape
+        img = F.pad(img, (kw//2, kh//2, kw//2, kh//2), mode='replicate')
+        return F.conv2d(img, self.kernel, groups=n_channels)
+
+    def laplacian_kernel(self, current):
+        filtered    = self.conv_gauss(current)
+        down        = filtered[:,:,::2,::2]
+        new_filter  = torch.zeros_like(filtered)
+        new_filter[:,:,::2,::2] = down*4
+        filtered    = self.conv_gauss(new_filter)
+        diff = current - filtered
+        return diff
 
     def forward(self, x, y):
-        # Compute the 2D FFT of both images
-        x_fft = fft2(x, dim=(-2, -1))
-        y_fft = fft2(y, dim=(-2, -1))
+        loss = self.loss(self.laplacian_kernel(x.to('cuda:0')), self.laplacian_kernel(y.to('cuda:0')))
+        return loss
 
-        # Separate amplitude and phase components
-        x_amp = torch.abs(x_fft)
-        y_amp = torch.abs(y_fft)
-        x_phase = torch.angle(x_fft)
-        y_phase = torch.angle(y_fft)
 
-        # Compute the L1 loss for amplitude and phase
-        amp_loss = torch.mean(torch.abs(x_amp - y_amp))
-        phase_loss = torch.mean(torch.abs(x_phase - y_phase))
+class fftLoss(nn.Module):
+    def __init__(self):
+        super(fftLoss, self).__init__()
 
-        return amp_loss + phase_loss
+    def forward(self, x, y):
+        diff = torch.fft.fft2(x.to('cuda:0')) - torch.fft.fft2(y.to('cuda:0'))
+        loss = torch.mean(abs(diff))
+        return loss
+
 
 def train(train_loader, network, optimizer, scaler):
     losses = AverageMeter()
+    char_losses = AverageMeter()
+    fft_losses = AverageMeter()
+    edge_losses = AverageMeter()
 
     torch.cuda.empty_cache()
     network.train()
-    criterion_spa = SpatialLoss()
-    criterion_fre = FrequencyLoss()
-    alpha = 0.05  # Weight for frequency loss
+    
+    # 使用新的损失函数
+    criterion_char = CharbonnierLoss()
+    criterion_fft = fftLoss()
+    criterion_edge = EdgeLoss()
+    
+    # 按照指定权重组合损失: loss = char + 0.01*fft + 0.05*edge
+    weight_fft = 0.01
+    weight_edge = 0.05
 
-    for batch in train_loader:
+    for batch_idx, batch in enumerate(train_loader):
         source_img = batch['source'].cuda()
         target_img = batch['target'].cuda()
 
         with autocast(args.no_autocast):
             output = network(source_img)
 
-            # Calculate spatial loss
-            loss_spa = criterion_spa(output, target_img)
+            # 计算各种损失
+            loss_char = criterion_char(output, target_img)
+            loss_fft = criterion_fft(output, target_img)
+            loss_edge = criterion_edge(output, target_img)
 
-            # Calculate frequency loss
-            loss_fre = criterion_fre(output, target_img)
-
-            # Total loss is the sum of spatial loss and weighted frequency loss
-            loss = loss_spa + alpha * loss_fre
+            # 总损失是按权重组合的损失
+            loss = loss_char + weight_fft * loss_fft + weight_edge * loss_edge
 
         losses.update(loss.item())
+        char_losses.update(loss_char.item())
+        fft_losses.update(loss_fft.item())
+        edge_losses.update(loss_edge.item())
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
+        # 每100个batch打印一次各个损失值
+        if batch_idx % 100 == 0:
+            print(f'Batch {batch_idx}: '
+                  f'Total Loss: {losses.val:.4f} ({losses.avg:.4f}), '
+                  f'Char Loss: {char_losses.val:.4f} ({char_losses.avg:.4f}), '
+                  f'FFT Loss: {fft_losses.val:.4f} ({fft_losses.avg:.4f}), '
+                  f'Edge Loss: {edge_losses.val:.4f} ({edge_losses.avg:.4f})')
+
+    # 打印本轮训练的平均损失
+    print(f'Epoch Training - '
+          f'Average Total Loss: {losses.avg:.4f}, '
+          f'Average Char Loss: {char_losses.avg:.4f}, '
+          f'Average FFT Loss: {fft_losses.avg:.4f}, '
+          f'Average Edge Loss: {edge_losses.avg:.4f}')
+    
     return losses.avg
+
 
 def valid(val_loader, network):
     PSNR = AverageMeter()
@@ -126,6 +177,7 @@ def valid(val_loader, network):
 
     print(f"Current PSNR: {PSNR.avg:.4f}")
     return PSNR.avg, SSIM_values.avg, LPIPS_values.avg
+
 
 def plot_curves(train_losses, psnr_values, ssim_values, lpips_values, save_dir):
     epochs = range(1, len(train_losses) + 1)
@@ -168,6 +220,7 @@ def plot_curves(train_losses, psnr_values, ssim_values, lpips_values, save_dir):
 
     plt.show()
 
+
 if __name__ == '__main__':
     # === Step 1: 创建原始模型（不带 DataParallel）===
     model = eval(args.model.replace('-', '_'))().cuda()
@@ -202,7 +255,7 @@ if __name__ == '__main__':
     train_dataset = PairLoader(dataset_dir, 'train', 'train',
                                 setting['patch_size'], setting['edge_decay'], setting['only_h_flip'])
     train_loader = DataLoader(train_dataset,
-                              batch_size=9,
+                              batch_size=20,
                               shuffle=True,
                               num_workers=args.num_workers,
                               pin_memory=True,
@@ -210,7 +263,7 @@ if __name__ == '__main__':
     val_dataset = PairLoader(dataset_dir, 'test', setting['valid_mode'],
                               setting['patch_size'])
     val_loader = DataLoader(val_dataset,
-                            batch_size=9,
+                            batch_size=20,
                             num_workers=args.num_workers,
                             pin_memory=True)
 
